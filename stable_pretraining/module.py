@@ -401,7 +401,8 @@ class Module(pl.LightningModule):
 
         Args:
             optim_items: list of (name, config) where config contains a "modules" regex
-                describing group membership.
+                describing group membership. config may also contain an optional "param_filter"
+                callable that takes a parameter name and returns True/False for inclusion.
 
         Returns:
             params_by_name: dict[name, List[nn.Parameter]]
@@ -409,12 +410,13 @@ class Module(pl.LightningModule):
         """
         # Pre-compile regex with stable order from optim_items
         compiled = [
-            (name, re.compile(config["modules"])) for name, config in optim_items
+            (name, re.compile(config["modules"]), config.get("param_filter"))
+            for name, config in optim_items
         ]
 
         # Initialize containers
-        params_by_name = {name: [] for name, _ in compiled}
-        modules_by_name = {name: [] for name, _ in compiled}
+        params_by_name = {name: [] for name, _ in optim_items}
+        modules_by_name = {name: [] for name, _ in optim_items}
 
         # Map module -> group index with inheritance
         module_to_group = {}
@@ -430,7 +432,7 @@ class Module(pl.LightningModule):
                 group_idx = None
 
             # override if explicit match
-            for idx, (_, regex) in enumerate(compiled):
+            for idx, (_, regex, _) in enumerate(compiled):
                 if regex.match(qual_name):
                     group_idx = idx
                     break
@@ -439,12 +441,13 @@ class Module(pl.LightningModule):
 
             if group_idx is not None:
                 group_name = compiled[group_idx][0]
+                param_filter = compiled[group_idx][2]
                 # record module name
                 modules_by_name[group_name].append(qual_name)
-                # collect direct parameters only to avoid duplication
-                direct_params = list(module.parameters(recurse=False))
-                if direct_params:
-                    params_by_name[group_name].extend(direct_params)
+                # filter direct parameters only to avoid duplication
+                for param_name, param in module.named_parameters(recurse=False):
+                    if param_filter is None or param_filter(param_name):
+                        params_by_name[group_name].append(param)
 
         # Logging summary
         rows = []
