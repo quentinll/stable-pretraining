@@ -397,16 +397,14 @@ class Module(pl.LightningModule):
         return scheduler_dict
 
     def _collect_parameters_by_optimizer_groups(self, optim_items):
-        """Assign modules and collect parameters per optimizer group defined by regex.
+        """Assign parameters to optimizer groups.
 
-        Args:
-            optim_items: list of (name, config) where config contains a "modules" regex
-                describing group membership. config may also contain an optional "param_filter"
-                callable that takes a parameter name and returns True/False for inclusion.
-
-        Returns:
-            params_by_name: dict[name, List[nn.Parameter]]
-            modules_by_name: dict[name, List[str]]
+        Logic:
+        1. Modules can match multiple optimizer groups (via regex).
+        2. Inheritance: If a module has no explicit regex match, it inherits ALL groups from its parent.
+        3. Parameter Assignment: For every parameter in a module, we check the active groups
+           in order. The FIRST group whose filter accepts the parameter claims it.
+           (First Match Wins at the Parameter level).
         """
         # Pre-compile regex with stable order from optim_items
         compiled = [
@@ -418,36 +416,66 @@ class Module(pl.LightningModule):
         params_by_name = {name: [] for name, _ in optim_items}
         modules_by_name = {name: [] for name, _ in optim_items}
 
-        # Map module -> group index with inheritance
-        module_to_group = {}
+        # Map module -> List of (group_idx, group_name, param_filter)
+        # We store a LIST of potential groups, maintaining priority order
+        module_to_groups = {}
+
+        # Set to track claimed parameters to ensure strict exclusivity
+        # (Optional safety, but good for debugging double-claims)
+        claimed_params = set()
+
         for qual_name, module in self.named_modules():
             if "callbacks_modules" in qual_name or "callbacks_metrics" in qual_name:
                 continue
 
-            # inherit parent's group if any
-            if "." in qual_name:
-                parent_name = qual_name.rsplit(".", 1)[0]
-                group_idx = module_to_group.get(parent_name)
-            else:
-                group_idx = None
+            # Determine potential groups for this module
+            potential_groups = []
 
-            # override if explicit match
-            for idx, (_, regex, _) in enumerate(compiled):
+            # Check for explicit regex matches
+            explicit_matches = []
+            for idx, (name, regex, filt) in enumerate(compiled):
                 if regex.match(qual_name):
-                    group_idx = idx
-                    break
+                    explicit_matches.append((idx, name, filt))
 
-            module_to_group[qual_name] = group_idx
+            # Handle Inheritance vs Override
+            if explicit_matches:
+                # Explicit match overrides parent entirely
+                potential_groups = explicit_matches
+            elif "." in qual_name:
+                # Inherit parent's potential groups
+                parent_name = qual_name.rsplit(".", 1)[0]
+                potential_groups = module_to_groups.get(parent_name, [])
 
-            if group_idx is not None:
-                group_name = compiled[group_idx][0]
-                param_filter = compiled[group_idx][2]
-                # record module name
-                modules_by_name[group_name].append(qual_name)
-                # filter direct parameters only to avoid duplication
+            # Store for children
+            module_to_groups[qual_name] = potential_groups
+
+            if potential_groups:
+                # We only mark the module as "belonging" to a group if it actually contributes params
+                # This prevents empty modules from cluttering the logs
+
                 for param_name, param in module.named_parameters(recurse=False):
-                    if param_filter is None or param_filter(param_name):
-                        params_by_name[group_name].append(param)
+                    param_id = id(param)
+                    if param_id in claimed_params:
+                        continue
+
+                    # Try groups in priority order (Index 0 is highest priority)
+                    assigned = False
+                    for group_idx, group_name, param_filter in potential_groups:
+                        # If filter is None, it accepts everything (default behavior)
+                        # If filter exists, it must return True
+                        if param_filter is None or param_filter(param_name):
+                            params_by_name[group_name].append(param)
+
+                            # Track module membership for logging (deduplicated later)
+                            modules_by_name[group_name].append(qual_name)
+
+                            claimed_params.add(param_id)
+                            assigned = True
+                            break  # <--- FIRST MATCH WINS (Per Parameter)
+
+                    if not assigned:
+                        # Parameter was visible to groups but rejected by all filters
+                        pass
 
         # Logging summary
         rows = []
@@ -457,11 +485,13 @@ class Module(pl.LightningModule):
             num_tensors = len(tensors)
             num_elements = sum(int(p.numel()) for p in tensors)
             num_requires_grad = sum(int(p.requires_grad) for p in tensors)
+            num_modules = len(set(modules_by_name[group_name]))
+
             rows.append(
                 [
                     group_name,
                     pattern,
-                    len(modules_by_name[group_name]),
+                    num_modules,
                     num_tensors,
                     num_elements,
                     num_requires_grad,
